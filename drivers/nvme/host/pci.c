@@ -225,14 +225,17 @@ struct nvme_queue {
 struct nvme_iod {
 	struct nvme_request req;
 	struct nvme_queue *nvmeq;
+	bool ndp_flag;  /* judge whether to release the region of `first_lbalist_dma` */
 	bool use_sgl;
 	int aborted;
 	int npages;		/* In the PRP list. 0 means small pool in use */
 	int nents;		/* Used in scatterlist */
 	dma_addr_t first_dma;
+	dma_addr_t first_lbalist_dma; 
 	unsigned int dma_len;	/* length of single DMA segment mapping */
 	dma_addr_t meta_dma;
 	struct scatterlist *sg;
+	struct scatterlist *sg_lbalist; /* TODO, now useless */
 };
 
 static inline unsigned int nvme_dbbuf_size(struct nvme_dev *dev)
@@ -608,6 +611,11 @@ static void nvme_unmap_data(struct nvme_dev *dev, struct request *req)
 		nvme_free_sgls(dev, req);
 	else
 		nvme_free_prps(dev, req);
+	/* 解映射NDP命令的LBA list */
+	if(iod->ndp_flag){
+		dma_unmap_single(dev->dev,  iod->first_lbalist_dma, PAGE_SIZE, DMA_TO_DEVICE);	
+		iod->ndp_flag = false;
+	}
 	mempool_free(iod->sg, dev->iod_mempool);
 }
 
@@ -669,7 +677,7 @@ static blk_status_t nvme_pci_setup_prps(struct nvme_dev *dev,
 		iod->npages = 1;
 	}
 
-	prp_list = dma_pool_alloc(pool, GFP_ATOMIC, &prp_dma);
+	prp_list = dma_pool_alloc(pool, GFP_ATOMIC, &prp_dma);//prp list的物理地址保存在prp_dma中
 	if (!prp_list) {
 		iod->first_dma = dma_addr;
 		iod->npages = -1;
@@ -704,8 +712,8 @@ static blk_status_t nvme_pci_setup_prps(struct nvme_dev *dev,
 		dma_len = sg_dma_len(sg);
 	}
 done:
-	cmnd->dptr.prp1 = cpu_to_le64(sg_dma_address(iod->sg));
-	cmnd->dptr.prp2 = cpu_to_le64(iod->first_dma);
+	cmnd->dptr.prp1 = cpu_to_le64(sg_dma_address(iod->sg));//scatter list结构体的物理地址
+	cmnd->dptr.prp2 = cpu_to_le64(iod->first_dma);//PRP List的物理地址
 	return BLK_STS_OK;
 free_prps:
 	nvme_free_prps(dev, req);
@@ -837,13 +845,16 @@ static blk_status_t nvme_setup_sgl_simple(struct nvme_dev *dev,
 	return BLK_STS_OK;
 }
 
+uint64_t g_lba_list[64]; //如果放到函数栈中， dma_map_single 映射会失败
 static blk_status_t nvme_map_data(struct nvme_dev *dev, struct request *req,
 		struct nvme_command *cmnd)
 {
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+	struct NvmeNdpCmd *ndp_cmd=(struct NvmeNdpCmd *)cmnd;
 	blk_status_t ret = BLK_STS_RESOURCE;
 	int nr_mapped;
-
+	
+	iod->ndp_flag = false;
 	if (blk_rq_nr_phys_segments(req) == 1) {
 		struct bio_vec bv = req_bvec(req);
 
@@ -864,7 +875,7 @@ static blk_status_t nvme_map_data(struct nvme_dev *dev, struct request *req,
 	if (!iod->sg)
 		return BLK_STS_RESOURCE;
 	sg_init_table(iod->sg, blk_rq_nr_phys_segments(req));
-	iod->nents = blk_rq_map_sg(req->q, req, iod->sg);
+	iod->nents = blk_rq_map_sg(req->q, req, iod->sg);//将page cache页映射到scatter list中
 	if (!iod->nents)
 		goto out_free_sg;
 
@@ -884,6 +895,42 @@ static blk_status_t nvme_map_data(struct nvme_dev *dev, struct request *req,
 		ret = nvme_pci_setup_prps(dev, req, &cmnd->rw);
 	if (ret != BLK_STS_OK)
 		goto out_unmap_sg;
+	//TODO 
+	if(ndp_cmd->opcode == nvme_admin_ndp){
+		if(ndp_cmd->metadata_len > sizeof(g_lba_list))
+		{
+			pr_info("max 64 LBAs is supported!\n");
+			ret = BLK_STS_RESOURCE;
+		 	goto out_unmap_sg;
+		}
+		if(copy_from_user(g_lba_list, (void*)ndp_cmd->prp1_lba_list_addr, ndp_cmd->metadata_len)){
+			ret = -EFAULT;
+			goto out_unmap_sg;
+		}
+		// iod->sg_lbalist = mempool_alloc(dev->iod_mempool, GFP_ATOMIC);
+		// if (!iod->sg_lbalist){
+		// 	ret = BLK_STS_RESOURCE;
+		// 	goto out_unmap_sg;
+		// }
+		// sg_init_table(iod->sg_lbalist, 1);
+		//iod->first_lbalist_dma = dma_map_single(dev->dev,  (void*)(ndp_cmd->prp1_lba_list_addr), PAGE_SIZE, DMA_TO_DEVICE);
+		// for(i=0; i<20; i++) g_lba_list[i] = 20*i;
+		iod->first_lbalist_dma = dma_map_single(dev->dev,  (void*)g_lba_list, PAGE_SIZE, DMA_TO_DEVICE);//不能传一个用户态的指针！
+		if (dma_mapping_error(dev->dev, iod->first_lbalist_dma)){
+			ret = BLK_STS_RESOURCE;
+			pr_info("fail to map dma address\n");
+		 	goto out_unmap_sg;
+		}
+		ndp_cmd->prp1_lba_list_addr = iod->first_lbalist_dma;
+		pr_info("%s: map successful, prp address is %llx, metadata_len[%d]\n", __func__, iod->first_lbalist_dma, ndp_cmd->metadata_len);
+		ndp_cmd->prp2_lba_list_addr = 0;
+		iod->ndp_flag = true;//nvme_unmap_data释放时,需要区分NDP命令和非NDP命令
+		//ndp_cmd->prp1_lba_list_addr = cpu_to_le64(sg_dma_address(iod->sg_lbalist));//scatter list结构体的物理地址
+		//ndp_cmd->prp2_lba_list_addr = cpu_to_le64(iod->first_lbalist_dma);//PRP List的物理地址
+		//iod->nents = blk_rq_map_sg(req->q, req, iod->sg);/
+		//ret = nvme_pci_setup_prps(dev, req, &cmnd->rw);//设置cmd的lbalist字段
+	}
+	
 	return BLK_STS_OK;
 
 out_unmap_sg:
@@ -934,7 +981,13 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	ret = nvme_setup_cmd(ns, req, &cmnd);
 	if (ret)
 		return ret;
-
+#ifdef CONFIG_NDP_DEBUG
+	if(cmnd.common.opcode == nvme_cmd_ndp)
+		pr_info("nvme_queue_rq\t physical segments[%d]\n", blk_rq_nr_phys_segments(req));
+	if(cmnd.common.opcode == nvme_admin_ndp)//加一个管理队列的判断
+		pr_info("nvme_queue_rq\t physical segments[%d]\n", blk_rq_nr_phys_segments(req));
+#endif
+	
 	if (blk_rq_nr_phys_segments(req)) {
 		ret = nvme_map_data(dev, req, &cmnd);
 		if (ret)
@@ -948,7 +1001,7 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	}
 
 	blk_mq_start_request(req);
-	nvme_submit_cmd(nvmeq, &cmnd, bd->last);
+	nvme_submit_cmd(nvmeq, &cmnd, bd->last);//ADMIN / IO命令必经之路
 	return BLK_STS_OK;
 out_unmap_data:
 	nvme_unmap_data(dev, req);

@@ -583,6 +583,8 @@ static inline void nvme_clear_nvme_request(struct request *req)
 
 static inline unsigned int nvme_req_op(struct nvme_command *cmd)
 {
+	if(cmd->common.opcode == nvme_admin_ndp)
+		return REQ_OP_DRV_IN;
 	return nvme_is_write(cmd) ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN;
 }
 
@@ -816,6 +818,31 @@ static inline blk_status_t nvme_setup_write_zeroes(struct nvme_ns *ns,
 	return BLK_STS_OK;
 }
 
+//TODO：尚且不完善NVMe TCP的NDP IO
+static inline blk_status_t nvme_setup_ndp_command(struct nvme_ns *ns,
+		struct request *req, struct nvme_command *cmnd,
+		enum nvme_opcode op)
+{
+	u16 control = 0;
+	u32 dsmgmt = 0;
+
+	if (req->cmd_flags & REQ_FUA)
+		control |= NVME_RW_FUA;
+	if (req->cmd_flags & (REQ_FAILFAST_DEV | REQ_RAHEAD))
+		control |= NVME_RW_LR;
+
+	if (req->cmd_flags & REQ_RAHEAD)
+		dsmgmt |= NVME_RW_DSM_FREQ_PREFETCH;
+
+	cmnd->rw.opcode = op;
+	cmnd->rw.nsid = cpu_to_le32(ns->head->ns_id);
+	cmnd->rw.slba = cpu_to_le64(nvme_sect_to_lba(ns, blk_rq_pos(req)));
+	cmnd->rw.length = cpu_to_le16((blk_rq_bytes(req) >> ns->lba_shift) - 1);
+	// cmnd->rw.control = cpu_to_le16(control);
+	// cmnd->rw.dsmgmt = cpu_to_le32(dsmgmt);
+	return 0;
+
+}
 static inline blk_status_t nvme_setup_rw(struct nvme_ns *ns,
 		struct request *req, struct nvme_command *cmnd,
 		enum nvme_opcode op)
@@ -927,6 +954,9 @@ blk_status_t nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
 		break;
 	case REQ_OP_WRITE:
 		ret = nvme_setup_rw(ns, req, cmd, nvme_cmd_write);
+		break;
+	case REQ_OP_NDP://NVMe TCP传过来的的NDP IO
+		ret = nvme_setup_ndp_command(ns, req, cmd, nvme_cmd_ndp);
 		break;
 	case REQ_OP_ZONE_APPEND:
 		ret = nvme_setup_rw(ns, req, cmd, nvme_cmd_zone_append);
@@ -1163,7 +1193,7 @@ static int nvme_submit_user_cmd(struct request_queue *q,
 
 	if (ubuffer && bufflen) {
 		ret = blk_rq_map_user(q, req, NULL, ubuffer, bufflen,
-				GFP_KERNEL);
+				GFP_KERNEL);//最后传输到用户层的数据
 		if (ret)
 			goto out;
 		bio = req->bio;
@@ -1556,29 +1586,87 @@ static void __user *nvme_to_user_ptr(uintptr_t ptrval)
 	return (void __user *)ptrval;
 }
 
+static int nvme_submit_ndp_cmd(struct request_queue *q,
+		struct NvmeNdpCmd *cmd, void __user *ubuffer,
+		unsigned bufflen, void __user *meta_buffer, unsigned meta_len,
+		u32 meta_seed, u64 *result, unsigned timeout)
+{
+	bool write = false;//nvme_is_write(cmd);
+	struct nvme_ns *ns = q->queuedata;
+	struct block_device *bdev = ns ? ns->disk->part0 : NULL;
+	struct request *req;
+	struct bio *bio = NULL;
+	void *meta = NULL;
+	int ret;
+
+	req = nvme_alloc_request(q, (struct nvme_command *)cmd, 0);
+	if (IS_ERR(req))
+		return PTR_ERR(req);
+
+	if (timeout)
+		req->timeout = timeout;
+	nvme_req(req)->flags |= NVME_REQ_USERCMD;
+
+	if (ubuffer && bufflen) {
+		ret = blk_rq_map_user(q, req, NULL, ubuffer, bufflen,
+				GFP_KERNEL);//最后传输到用户层的数据, lba_list怎么传过去呢？
+		if (ret)
+			goto out;
+		bio = req->bio;
+		if (bdev)
+			bio_set_dev(bio, bdev);
+		if (bdev && meta_buffer && meta_len) {
+			meta = nvme_add_user_metadata(bio, meta_buffer, meta_len,
+					meta_seed, write);
+			if (IS_ERR(meta)) {
+				ret = PTR_ERR(meta);
+				goto out_unmap;
+			}
+			req->cmd_flags |= REQ_INTEGRITY;
+		}
+	}
+
+	nvme_execute_passthru_rq(req);
+	if (nvme_req(req)->flags & NVME_REQ_CANCELLED)
+		ret = -EINTR;
+	else
+		ret = nvme_req(req)->status;
+	if (result)
+		*result = le64_to_cpu(nvme_req(req)->result.u64);
+	if (meta && !ret && !write) {
+		if (copy_to_user(meta_buffer, meta, meta_len))
+			ret = -EFAULT;
+	}
+	kfree(meta);
+ out_unmap:
+	if (bio)
+		blk_rq_unmap_user(bio);
+ out:
+	blk_mq_free_request(req);
+	return ret;
+}
+
 static int nvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
 {
 	struct nvme_user_io io;
 	struct nvme_command c;
 	unsigned length, meta_len;
 	void __user *metadata;
-
 	if (copy_from_user(&io, uio, sizeof(io)))
 		return -EFAULT;
 	if (io.flags)
 		return -EINVAL;
-
 	switch (io.opcode) {
 	case nvme_cmd_write:
 	case nvme_cmd_read:
 	case nvme_cmd_compare:
+	case nvme_cmd_ndp://TODO：添加IO CONTROL支持
 		break;
 	default:
 		return -EINVAL;
 	}
 
 	length = (io.nblocks + 1) << ns->lba_shift;
-
 	if ((io.control & NVME_RW_PRINFO_PRACT) &&
 	    ns->ms == sizeof(struct t10_pi_tuple)) {
 		/*
@@ -1591,6 +1679,7 @@ static int nvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
 		metadata = NULL;
 	} else {
 		meta_len = (io.nblocks + 1) * ns->ms;
+		pr_info("meta_len:%d, ns->ms:%d\n", meta_len, ns->ms);
 		metadata = nvme_to_user_ptr(io.metadata);
 	}
 
@@ -1601,6 +1690,7 @@ static int nvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
 		if ((io.metadata & 3) || !io.metadata)
 			return -EINVAL;
 	}
+	//pr_info("meta_len: %d\n", meta_len);
 
 	memset(&c, 0, sizeof(c));
 	c.rw.opcode = io.opcode;
@@ -1624,6 +1714,7 @@ static int nvme_user_cmd(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 {
 	struct nvme_passthru_cmd cmd;
 	struct nvme_command c;
+	struct NvmeNdpCmd *ndp_cmd;
 	unsigned timeout = 0;
 	u64 result;
 	int status;
@@ -1634,12 +1725,12 @@ static int nvme_user_cmd(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 		return -EFAULT;
 	if (cmd.flags)
 		return -EINVAL;
-
+	ndp_cmd = (struct NvmeNdpCmd *)&cmd;
 	memset(&c, 0, sizeof(c));
 	c.common.opcode = cmd.opcode;
 	c.common.flags = cmd.flags;
 	c.common.nsid = cpu_to_le32(cmd.nsid);
-	c.common.cdw2[0] = cpu_to_le32(cmd.cdw2);
+	c.common.cdw2[0] = cpu_to_le32(cmd.cdw2);//lba list pointer
 	c.common.cdw2[1] = cpu_to_le32(cmd.cdw3);
 	c.common.cdw10 = cpu_to_le32(cmd.cdw10);
 	c.common.cdw11 = cpu_to_le32(cmd.cdw11);
@@ -1648,10 +1739,16 @@ static int nvme_user_cmd(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	c.common.cdw14 = cpu_to_le32(cmd.cdw14);
 	c.common.cdw15 = cpu_to_le32(cmd.cdw15);
 
+	pr_info("admin opcode=%x\n", cmd.opcode);
 	if (cmd.timeout_ms)
 		timeout = msecs_to_jiffies(cmd.timeout_ms);
-
-	status = nvme_submit_user_cmd(ns ? ns->queue : ctrl->admin_q, &c,
+	if(cmd.opcode == nvme_admin_ndp)
+		status = nvme_submit_user_cmd(ns ? ns->queue : ctrl->admin_q, &c,
+				nvme_to_user_ptr(ndp_cmd->prp1), ndp_cmd->result_buffer_len,
+				NULL, ndp_cmd->metadata_len,
+				0, &result, timeout);
+	else
+		status = nvme_submit_user_cmd(ns ? ns->queue : ctrl->admin_q, &c,
 			nvme_to_user_ptr(cmd.addr), cmd.data_len,
 			nvme_to_user_ptr(cmd.metadata), cmd.metadata_len,
 			0, &result, timeout);
@@ -1790,7 +1887,7 @@ static int nvme_ioctl(struct block_device *bdev, fmode_t mode,
 	 * seperately and drop the ns SRCU reference early.  This avoids a
 	 * deadlock when deleting namespaces using the passthrough interface.
 	 */
-	if (is_ctrl_ioctl(cmd))
+	if (is_ctrl_ioctl(cmd))//NVME_IOCTL_ADMIN_CMD的路径
 		return nvme_handle_ctrl_ioctl(ns, cmd, argp, head, srcu_idx);
 
 	switch (cmd) {
@@ -1799,10 +1896,10 @@ static int nvme_ioctl(struct block_device *bdev, fmode_t mode,
 		ret = ns->head->ns_id;
 		break;
 	case NVME_IOCTL_IO_CMD:
-		ret = nvme_user_cmd(ns->ctrl, ns, argp);
+		ret = nvme_user_cmd(ns->ctrl, ns, argp);//提交到admin队列
 		break;
 	case NVME_IOCTL_SUBMIT_IO:
-		ret = nvme_submit_io(ns, argp);
+		ret = nvme_submit_io(ns, argp);//提交到IO队列
 		break;
 	case NVME_IOCTL_IO64_CMD:
 		ret = nvme_user_cmd64(ns->ctrl, ns, argp);

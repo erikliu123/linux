@@ -682,6 +682,7 @@ enum nvme_opcode {
 	nvme_cmd_zone_mgmt_send	= 0x79,
 	nvme_cmd_zone_mgmt_recv	= 0x7a,
 	nvme_cmd_zone_append	= 0x7d,
+	nvme_cmd_ndp	= 0x20,
 };
 
 #define nvme_opcode_name(opcode)	{ opcode, #opcode }
@@ -994,6 +995,7 @@ enum nvme_admin_opcode {
 	nvme_admin_sanitize_nvm		= 0x84,
 	nvme_admin_get_lba_status	= 0x86,
 	nvme_admin_vendor_start		= 0xC0,
+	nvme_admin_ndp  = 0xb0, 
 };
 
 #define nvme_admin_opcode_name(opcode)	{ opcode, #opcode }
@@ -1398,6 +1400,21 @@ struct streams_directive_params {
 	__u8	rsvd2[6];
 };
 
+struct NvmeNdpCmd {
+	__u8	opcode;
+	__u8	flags;
+	__u16	cid;
+	__u32	nsid;
+	__le64	prp1_lba_list_addr;
+	__le64	metadata;
+	__le64	prp1;
+	__le64	prp2;
+	__le64	prp_lba_list;
+	__u32	result_buffer_len;
+	__u32	metadata_len;
+	__le64	prp2_lba_list_addr;
+};
+
 struct nvme_command {
 	union {
 		struct nvme_common_command common;
@@ -1421,6 +1438,7 @@ struct nvme_command {
 		struct nvmf_property_get_command prop_get;
 		struct nvme_dbbuf dbbuf;
 		struct nvme_directive_cmd directive;
+		struct NvmeNdpCmd ndp_cmd;
 	};
 };
 

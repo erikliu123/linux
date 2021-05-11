@@ -354,6 +354,8 @@ enum req_opf {
 	/* reset all the zone present on the device */
 	REQ_OP_ZONE_RESET_ALL	= 17,
 
+	REQ_OP_NDP	= 18, //NVNe TCP发送的NDP IO
+
 	/* SCSI passthrough using struct scsi_request */
 	REQ_OP_SCSI_IN		= 32,
 	REQ_OP_SCSI_OUT		= 33,
