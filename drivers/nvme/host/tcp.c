@@ -2238,8 +2238,12 @@ static blk_status_t nvme_tcp_map_data(struct nvme_tcp_queue *queue,
 	struct nvme_command *c = &pdu->cmd;
 
 	c->common.flags |= NVME_CMD_SGL_METABUF;
-
-	if (!blk_rq_nr_phys_segments(rq))
+	if((c->common.opcode == 0x20 || c->common.opcode == 0x2) && c->common.nsid != 0)
+	{
+		pr_info("%s: opcode:[%d], segments:[%d], data_len:[%d]\n", __func__, c->common.opcode, blk_rq_nr_phys_segments(rq), req->data_len);
+		nvme_tcp_set_sg_host_data(c, req->data_len);
+	}
+	else if (!blk_rq_nr_phys_segments(rq))
 		nvme_tcp_set_sg_null(c);
 	else if (rq_data_dir(rq) == WRITE &&
 	    req->data_len <= nvme_tcp_inline_data_size(queue))
@@ -2264,6 +2268,7 @@ static blk_status_t nvme_tcp_setup_cmd_pdu(struct nvme_ns *ns,
 		return ret;
 	if(pdu->cmd.common.opcode == nvme_cmd_ndp_io && pdu->cmd.common.nsid!=0)//NDP命令+IO队列
 		pdu->cmd.common.flags |= NVME_CMD_SGL_ALL;
+	
 	req->state = NVME_TCP_SEND_CMD_PDU;
 	req->offset = 0;
 	req->data_sent = 0;
@@ -2292,7 +2297,7 @@ static blk_status_t nvme_tcp_setup_cmd_pdu(struct nvme_ns *ns,
 	pdu->hdr.plen =
 		cpu_to_le32(pdu->hdr.hlen + hdgst + req->pdu_len + ddgst);
 
-	ret = nvme_tcp_map_data(queue, rq);
+	ret = nvme_tcp_map_data(queue, rq);//这里涉及SGL的分配
 	if (unlikely(ret)) {
 		nvme_cleanup_cmd(rq);
 		dev_err(queue->ctrl->ctrl.device,

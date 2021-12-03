@@ -606,9 +606,9 @@ struct request *nvme_alloc_request(struct request_queue *q,
 {
 	struct request *req;
 
-	req = blk_mq_alloc_request(q, nvme_req_op(cmd), flags);
-	if (!IS_ERR(req))
+	req = blk_mq_alloc_request(q, nvme_req_op(cmd), flags);//TODO:增加REQ类型
 		nvme_init_request(req, cmd);
+	if (!IS_ERR(req))
 	return req;
 }
 EXPORT_SYMBOL_GPL(nvme_alloc_request);
@@ -1183,15 +1183,18 @@ static int nvme_submit_user_cmd(struct request_queue *q,
 	void *meta = NULL;
 	int ret;
 
-	req = nvme_alloc_request(q, cmd, 0);
+	req = nvme_alloc_request(q, cmd, 0);//从request queue中获得一个请求
 	if (IS_ERR(req))
 		return PTR_ERR(req);
 
 	if (timeout)
 		req->timeout = timeout;
 	nvme_req(req)->flags |= NVME_REQ_USERCMD;
-
-	if (ubuffer && bufflen) {
+	if((cmd->common.opcode==0x2 || cmd->common.opcode=0x20) && cmd->common.nsid)
+	{
+		pr_info("%s: buffer addr[%x], buffer len[%u]\n", __func__, ubuffer, bufflen);
+	}
+	if (ubuffer && bufflen) {//读写的数据
 		ret = blk_rq_map_user(q, req, NULL, ubuffer, bufflen,
 				GFP_KERNEL);//最后传输到用户层的数据
 		if (ret)
@@ -1896,7 +1899,7 @@ static int nvme_ioctl(struct block_device *bdev, fmode_t mode,
 		ret = ns->head->ns_id;
 		break;
 	case NVME_IOCTL_IO_CMD:
-		ret = nvme_user_cmd(ns->ctrl, ns, argp);//提交到admin队列
+		ret = nvme_user_cmd(ns->ctrl, ns, argp);//io passthru
 		break;
 	case NVME_IOCTL_SUBMIT_IO:
 		ret = nvme_submit_io(ns, argp);//提交到IO队列
