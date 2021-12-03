@@ -609,6 +609,7 @@ struct request *nvme_alloc_request(struct request_queue *q,
 	req = blk_mq_alloc_request(q, nvme_req_op(cmd), flags);//TODO:增加REQ类型
 		nvme_init_request(req, cmd);
 	if (!IS_ERR(req))
+		nvme_init_request(req, cmd);
 	return req;
 }
 EXPORT_SYMBOL_GPL(nvme_alloc_request);
