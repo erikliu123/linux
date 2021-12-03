@@ -679,6 +679,7 @@ enum nvme_opcode {
 	nvme_cmd_resv_report	= 0x0e,
 	nvme_cmd_resv_acquire	= 0x11,
 	nvme_cmd_resv_release	= 0x15,
+	nvme_cmd_ndp_io = 0x20,
 	nvme_cmd_zone_mgmt_send	= 0x79,
 	nvme_cmd_zone_mgmt_recv	= 0x7a,
 	nvme_cmd_zone_append	= 0x7d,
@@ -995,7 +996,7 @@ enum nvme_admin_opcode {
 	nvme_admin_sanitize_nvm		= 0x84,
 	nvme_admin_get_lba_status	= 0x86,
 	nvme_admin_vendor_start		= 0xC0,
-	nvme_admin_ndp  = 0xb0, 
+	nvme_admin_ndp  = 0xb0,
 };
 
 #define nvme_admin_opcode_name(opcode)	{ opcode, #opcode }

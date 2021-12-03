@@ -2262,7 +2262,8 @@ static blk_status_t nvme_tcp_setup_cmd_pdu(struct nvme_ns *ns,
 	ret = nvme_setup_cmd(ns, rq, &pdu->cmd);
 	if (ret)
 		return ret;
-
+	if(pdu->cmd.common.opcode == nvme_cmd_ndp_io && pdu->cmd.common.nsid!=0)//NDP命令+IO队列
+		pdu->cmd.common.flags |= NVME_CMD_SGL_ALL;
 	req->state = NVME_TCP_SEND_CMD_PDU;
 	req->offset = 0;
 	req->data_sent = 0;
