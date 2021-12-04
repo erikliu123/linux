@@ -979,7 +979,7 @@ static int nvme_tcp_try_send_cmd_pdu(struct nvme_tcp_request *req)
 
 	len -= ret;
 	if (!len) {
-		if (inline_data) {
+		if (inline_data) {//写数据时，会有inline data
 			req->state = NVME_TCP_SEND_DATA;
 			if (queue->data_digest)
 				crypto_ahash_init(queue->snd_hash);
@@ -1055,19 +1055,29 @@ static int nvme_tcp_try_send(struct nvme_tcp_queue *queue)
 	struct nvme_tcp_request *req;
 	int ret = 1;
 
+
 	if (!queue->request) {
 		queue->request = nvme_tcp_fetch_request(queue);
 		if (!queue->request)
 			return 0;
 	}
 	req = queue->request;
-
+	bool print_debug = false;
+	if(req->req.cmd->common.opcode == 0x2 || req->req.cmd->common == 0x20)
+	{
+		print_debug = true;
+	}
 	if (req->state == NVME_TCP_SEND_CMD_PDU) {
 		ret = nvme_tcp_try_send_cmd_pdu(req);
-		if (ret <= 0)
+		if (ret <= 0)//read应当返回>0
 			goto done;
 		if (!nvme_tcp_has_inline_data(req))
 			return ret;
+	}
+
+	if(print_debug)
+	{
+		pr_info("opcode[%d], state:NVME_TCP_SEND_H2C_PDU\n", req->req.cmd->common.opcode);
 	}
 
 	if (req->state == NVME_TCP_SEND_H2C_PDU) {
@@ -1076,10 +1086,21 @@ static int nvme_tcp_try_send(struct nvme_tcp_queue *queue)
 			goto done;
 	}
 
+	if(print_debug)
+	{
+		pr_info("opcode[%d], state:NVME_TCP_SEND_DATA!!!\n", req->req.cmd->common.opcode);
+	}
+
+
 	if (req->state == NVME_TCP_SEND_DATA) {
 		ret = nvme_tcp_try_send_data(req);
 		if (ret <= 0)
 			goto done;
+	}
+
+	if(print_debug)
+	{
+		pr_info("opcode[%d], state:NVME_TCP_SEND_DDGST!!!\n", req->req.cmd->common.opcode);
 	}
 
 	if (req->state == NVME_TCP_SEND_DDGST)
@@ -2238,7 +2259,7 @@ static blk_status_t nvme_tcp_map_data(struct nvme_tcp_queue *queue,
 	struct nvme_command *c = &pdu->cmd;
 
 	c->common.flags |= NVME_CMD_SGL_METABUF;
-	if((c->common.opcode == 0x20 || c->common.opcode == 0x2) && c->common.nsid != 0)
+	if((c->common.opcode == 0x82 || c->common.opcode == 0x2) && c->common.nsid != 0)
 	{
 		pr_info("%s: opcode:[%d], segments:[%d], data_len:[%d]\n", __func__, c->common.opcode, blk_rq_nr_phys_segments(rq), req->data_len);
 		nvme_tcp_set_sg_host_data(c, req->data_len);
@@ -2266,9 +2287,9 @@ static blk_status_t nvme_tcp_setup_cmd_pdu(struct nvme_ns *ns,
 	ret = nvme_setup_cmd(ns, rq, &pdu->cmd);
 	if (ret)
 		return ret;
-	if(pdu->cmd.common.opcode == nvme_cmd_ndp_io && pdu->cmd.common.nsid!=0)//NDP命令+IO队列
-		pdu->cmd.common.flags |= NVME_CMD_SGL_ALL;
-	
+	// if(pdu->cmd.common.opcode == nvme_cmd_ndp_io && pdu->cmd.common.nsid!=0)//NDP命令+IO队列
+	// 	pdu->cmd.common.flags |= NVME_CMD_SGL_ALL;
+
 	req->state = NVME_TCP_SEND_CMD_PDU;
 	req->offset = 0;
 	req->data_sent = 0;

@@ -1191,7 +1191,7 @@ static int nvme_submit_user_cmd(struct request_queue *q,
 	if (timeout)
 		req->timeout = timeout;
 	nvme_req(req)->flags |= NVME_REQ_USERCMD;
-	if((cmd->common.opcode==0x2 || cmd->common.opcode=0x20) && cmd->common.nsid)
+	if((cmd->common.opcode==0x2 || cmd->common.opcode==0x20) && cmd->common.nsid)
 	{
 		pr_info("%s: buffer addr[%x], buffer len[%u]\n", __func__, ubuffer, bufflen);
 	}

@@ -30,8 +30,6 @@ clean:
 	rm -f modules.order Module.symvers Module.markers
 
 .PHNOY:
-    modules modules_install clean
-
-
+	modules modules_install clean
 
 endif
